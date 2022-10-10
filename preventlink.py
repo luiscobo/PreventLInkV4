@@ -3,6 +3,10 @@ import cv2 as cv
 import numpy as np
 import time
 
+from sllurp import llrp
+from twisted.internet import reactor
+import logging
+
 from threading import Timer
 
 import httpexample
@@ -20,8 +24,19 @@ TIEMPO_APAGADO_MAQUINA = 15.0  # Segundos
 TIEMPO_ALARMA = 5.0  # Segundos
 TIEMPO_DANGER = 10.0
 
+# Host del lector RFID
+HOST_RFID_READER = "192.168.0.51"
+tag_list = ['30340bc9e420e0ef80769001', '30396062c397384000078634', 'ad29140012199986600000ae',
+            'ad2914001218b18763000096']
+todos_presentes = False
+
+
 # Imagenes
 imagen = None
+
+# Configuración del RFID READER
+logging.basicConfig(format='%(asctime)s %(message)s')
+logging.getLogger().setLevel(logging.INFO)
 
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -125,7 +140,7 @@ class Predictor:
                     confidences.append(float(confidence))
                     boxes.append([left, top, width, height])
 
-        # Perform non maximum suppression to eliminate redundant overlapping boxes with
+        # Perform non-maximum suppression to eliminate redundant overlapping boxes with
         # lower confidences.
         indices = cv.dnn.NMSBoxes(boxes, confidences, confThreshold, nmsThreshold)
         count_person = 0  # for counting the classes in this loop.
@@ -186,6 +201,29 @@ class RepeatedTimer(Timer):
             self.function(*self.args, **self.kwargs)
 
 
+# ---------------------------- TAG READER ---------------
+
+def existe_tag(tag):
+    global tag_list
+    return tag in tag_list
+
+
+def cb(tagReport):
+    global tag_list, todos_presentes
+    contador = 0
+    tags = tagReport.msgdict['RO_ACCESS_REPORT']['TagReportData']
+    for tag in tags:
+        if 'EPC-96' in tag:
+            tag_id = tag['EPC-96'].decode()
+            logging.info("Tag encontrado: %s", tag_id)
+            if existe_tag(tag_id):
+                contador += 1
+
+    if contador == len(tag_list):
+        todos_presentes = True
+    else:
+        todos_presentes = False
+
 def start_an_alarm():
     global tiempo_ultima_aparicion, maquina_activa
     global casco, TIEMPO_ALARMA, TIEMPO_DANGER, TIEMPO_APAGADO_MAQUINA
@@ -220,6 +258,33 @@ def start_an_alarm():
 # -------------------- Programa principal ------------------------------------------
 
 if __name__ == '__main__':
+    # ---------  Arrancando el RFID Reader ------------------
+    factory_args = dict(
+        duration=3,
+        start_inventory=True,
+        disconnect_when_done=True,
+        reconnect=True,
+        tag_content_selector={
+            'EnableROSpecID': False,
+            'EnableSpecIndex': False,
+            'EnableInventoryParameterSpecID': False,
+            'EnableAntennaID': False,
+            'EnableChannelIndex': True,
+            'EnablePeakRSSI': False,
+            'EnableFirstSeenTimestamp': False,
+            'EnableLastSeenTimestamp': True,
+            'EnableTagSeenCount': True,
+            'EnableAccessSpecID': False
+        },
+        impinj_tag_content_selector=None,
+    )
+    fac = llrp.LLRPClientFactory(**factory_args)
+    fac.addTagReportCallback(cb)
+    logging.info("Connecting...")
+    reactor.connectTCP(HOST_RFID_READER, llrp.LLRP_PORT, fac, timeout=3)
+    logging.info("Running...")
+    reactor.run()
+
     print("Creando el predictor")
     predictor = Predictor(modelConfiguration, modelWeights)
 
@@ -245,7 +310,7 @@ if __name__ == '__main__':
         imagen = img.copy()
         frame_count = 0
         if ret:
-            casco = predictor.predict(imagen)
+            casco = predictor.predict(imagen) and todos_presentes
             if casco:
                 tiempo_ultima_aparicion = 0.0
                 print(f"Hay casco!")
